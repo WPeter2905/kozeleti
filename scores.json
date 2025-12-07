@@ -1,0 +1,56 @@
+[
+  {
+    "name": "Ivanics Patrik",
+    "time": "2005.09.15",
+    "neptun": "PXPR6K",
+    "major": "Pénzügy és számvitel, BSc",
+    "pontszam": [
+      15,
+      10,
+      10,
+      5,
+      2,
+      5,
+      2
+    ],
+    "is_relevant": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ],
+    "is_done": false,
+    "leiras": "Ügyes volt",
+    "kategoria": "4."
+  },
+  {
+    "name": "Wratschko Peter",
+    "time": "2006.05.29",
+    "neptun": "QXK6U0",
+    "major": "Gazdálkodás és Menedzsment",
+    "pontszam": [
+      3,
+      null,
+      1,
+      null,
+      null,
+      null,
+      null
+    ],
+    "is_relevant": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "is_done": false,
+    "leiras": "",
+    "kategoria": ""
+  }
+]
