@@ -231,66 +231,94 @@ def fill_word_document(student: Dict[str, Any], template_path: Path = Path('sabl
     That preserves the template's visual style while removing the extra blank rows.
     """
     from docx import Document
+    import zipfile
+    import tempfile
+    import shutil
 
     try:
         output_dir = Path('filled_documents')
         output_dir.mkdir(exist_ok=True)
 
-        doc = Document(str(template_path))
-
-        # Collect filled values so we can locate where to remove the preceding blank paragraph
-        filled_values: List[str] = []
-
-        def put(key: str, value: Any):
-            replace_text_in_doc(doc, key, str(value))
-            filled_values.append(str(value))
-
-        # Basic student info
-        put('[NÉV]', student['name'])
-        put('[NEPTUN]', student['neptun'])
-        put('[SZAK]', student['major'])
-        put('[ÉV]', student['time'])
-        put('[KATEGORIA]', student.get('kategoria', ''))
-
-        # Totals
+        # First, do direct XML replacement on the template
+        temp_dir = Path(tempfile.mkdtemp())
+        temp_template = temp_dir / 'template.docx'
+        shutil.copy(template_path, temp_template)
+        
+        # Build replacement map
+        replacements = {}
+        replacements['[NÉV]'] = student['name']
+        replacements['[NEPTUN]'] = student['neptun']
+        replacements['[SZAK]'] = student['major']
+        replacements['[ÉV]'] = student['time']
+        replacements['[KATEGORIA]'] = student.get('kategoria', '')
+        
         total = 0
         for i, p in enumerate(student['pontszam']):
             if p is not None and student['is_relevant'][i]:
                 total += p
-
-        put('[ÖSSZ_PONT]', total)
-
+        
+        replacements['[ÖSSZ_PONT]'] = str(total)
         max_total = sum(max(c['pont']) for c in CRITERIA)
-        put('[MAX_PONT]', max_total)
-
+        replacements['[MAX_PONT]'] = str(max_total)
         osszeg = calculate_osszeg(total)
-        put('[OSSZEG]', osszeg)
-
-        put('[LEIRAS]', student.get('leiras', ''))
-
-        # Criteria values
+        replacements['[OSSZEG]'] = str(osszeg)
+        replacements['[LEIRAS]'] = student.get('leiras', '')
+        
         for i, crit in enumerate(CRITERIA):
             point_value = student['pontszam'][i]
             is_relevant = student['is_relevant'][i]
-
-            pt_str = str(point_value) if point_value is not None else '0'
-            put(f'[TEV{i+1}_PONT]', pt_str)
-
+            
             if not is_relevant:
+                pt_str = '0'
                 grade_text = "Jelen szempont a közéleti tevékenység végzése szempontjából nem releváns"
             elif point_value is not None:
+                pt_str = str(point_value)
                 grade_text = get_grade_text_word(point_value, crit)
             else:
+                pt_str = '0'
                 grade_text = "Nincs választás"
-
-            put(f'[TEV{i+1}_SZOV]', grade_text)
-
-        # Transfer paragraph formatting and remove preceding blank rows where needed
-        transfer_format_and_remove_prev_blank(doc, filled_values)
-
-        # Save
+            
+            replacements[f'[TEV{i+1}_PONT]'] = pt_str
+            replacements[f'[TEV{i+1}_SZOV]'] = grade_text
+        
+        # Extract docx, replace in XML files, repack
+        with zipfile.ZipFile(temp_template, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir / 'docx_contents')
+        
+        # Replace in all XML files
+        found_placeholders = set()
+        for xml_file in (temp_dir / 'docx_contents').rglob('*.xml'):
+            try:
+                content = xml_file.read_text(encoding='utf-8')
+                # Check which placeholders are actually in the file
+                for placeholder in replacements.keys():
+                    if placeholder in content:
+                        found_placeholders.add(placeholder)
+                
+                for placeholder, value in replacements.items():
+                    content = content.replace(placeholder, str(value))
+                xml_file.write_text(content, encoding='utf-8')
+            except Exception:
+                pass
+        
+        # Debug: show which placeholders were found
+        not_found = set(replacements.keys()) - found_placeholders
+        if not_found:
+            st.warning(f"⚠️ Ezek a helyőrzők NEM találhatók a sablonban: {', '.join(not_found)}")
+            st.info(f"✓ Ezek a helyőrzők MEGTALÁLHATÓK: {', '.join(found_placeholders) if found_placeholders else 'EGYIK SEM'}")
+            st.info("💡 Kérlek ellenőrizd, hogy a Word sablonban pontosan ezek a karakterláncok szerepelnek-e (pl. [NEPTUN], [ÉV], stb.)")
+        
+        # Repack as docx
         output_file = output_dir / f"{student['name']}_{student['neptun']}.docx"
-        doc.save(str(output_file))
+        with zipfile.ZipFile(output_file, 'w', zipfile.ZIP_DEFLATED) as docx:
+            for file in (temp_dir / 'docx_contents').rglob('*'):
+                if file.is_file():
+                    arcname = file.relative_to(temp_dir / 'docx_contents')
+                    docx.write(file, arcname)
+        
+        # Cleanup temp directory
+        shutil.rmtree(temp_dir)
+        
         return output_file
 
     except Exception as e:
@@ -299,127 +327,123 @@ def fill_word_document(student: Dict[str, Any], template_path: Path = Path('sabl
 
 
 def replace_text_in_doc(doc, old_text: str, new_text: str):
-    """Replace text in Word document, handling runs properly and removing one blank line before each placeholder."""
-    # Replace in paragraphs
-    for paragraph in doc.paragraphs:
-        if old_text in paragraph.text:
-            # Build full text from runs
-            full_text = ''.join(run.text for run in paragraph.runs)
-            if old_text in full_text:
-                # Replace the text first
-                new_full_text = full_text.replace(old_text, new_text)
-                # Clear all runs
-                for run in paragraph.runs:
-                    run.text = ""
-                # Add new text to first run
-                if paragraph.runs:
-                    paragraph.runs[0].text = new_full_text
-                else:
-                    paragraph.add_run(new_full_text)
+    """Replace placeholders without losing run-level styling."""
+
+    def replace_in_paragraph(paragraph):
+        replaced = False
+        # Fast path when the placeholder sits wholly inside single runs
+        for run in paragraph.runs:
+            if old_text in run.text:
+                run.text = run.text.replace(old_text, new_text)
+                replaced = True
+        if replaced:
+            return
+
+        # Fallback for placeholders split across multiple runs
+        full_text = "".join(run.text for run in paragraph.runs)
+        if old_text not in full_text:
+            return
+
+        start = full_text.find(old_text)
+        end = start + len(old_text)
+
+        current = 0
+        inserted = False
+        parts_by_run = {run: [] for run in paragraph.runs}
+
+        for run in paragraph.runs:
+            text = run.text
+            length = len(text)
+            run_end = current + length
+
+            if run_end <= start or current >= end:
+                parts_by_run[run].append(text)
+            else:
+                prefix_len = max(0, start - current)
+                suffix_len = max(0, run_end - end)
+                if prefix_len:
+                    parts_by_run[run].append(text[:prefix_len])
+                if not inserted:
+                    parts_by_run[run].append(new_text)
+                    inserted = True
+                if suffix_len:
+                    parts_by_run[run].append(text[length - suffix_len:])
+            current += length
+
+        for run in paragraph.runs:
+            run.text = "".join(parts_by_run.get(run, []))
+
+    def walk_paragraphs(paragraphs):
+        for paragraph in paragraphs:
+            if old_text in paragraph.text:
+                try:
+                    replace_in_paragraph(paragraph)
+                except Exception:
+                    pass
+
+    def walk_tables(tables):
+        for table in tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    walk_paragraphs(cell.paragraphs)
+                    walk_tables(cell.tables)
+
+    # Body
+    walk_paragraphs(doc.paragraphs)
+    walk_tables(doc.tables)
+
+    # Headers and footers
+    for section in doc.sections:
+        walk_paragraphs(section.header.paragraphs)
+        walk_tables(section.header.tables)
+        walk_paragraphs(section.footer.paragraphs)
+        walk_tables(section.footer.tables)
+
+    # Text boxes (shapes) in headers/footers/sections where placeholders often live
+    def walk_shapes(shapes):
+        for shape in shapes:
+            # Some shapes can contain text frames; if so, process their paragraphs/tables
+            if hasattr(shape, "text_frame") and shape.text_frame is not None:
+                walk_paragraphs(shape.text_frame.paragraphs)
+                walk_tables(shape.text_frame.tables)
+
+    for section in doc.sections:
+        try:
+            if hasattr(section, 'header') and hasattr(section.header, 'shapes'):
+                walk_shapes(section.header.shapes)
+        except Exception:
+            pass
+        try:
+            if hasattr(section, 'footer') and hasattr(section.footer, 'shapes'):
+                walk_shapes(section.footer.shapes)
+        except Exception:
+            pass
+
+    # Fallback: replace in all text nodes (w:t) anywhere in the document tree
+    try:
+        namespaces = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+        text_elements = doc.element.xpath('.//w:t', namespaces=namespaces)
+        for t in text_elements:
+            if t.text and old_text in t.text:
+                t.text = t.text.replace(old_text, new_text)
+    except Exception as e:
+        # Silently continue if xpath fails
+        pass
     
-    # Replace in tables
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    if old_text in paragraph.text:
-                        full_text = ''.join(run.text for run in paragraph.runs)
-                        if old_text in full_text:
-                            # Replace the text
-                            new_full_text = full_text.replace(old_text, new_text)
-                            for run in paragraph.runs:
-                                run.text = ""
-                            if paragraph.runs:
-                                paragraph.runs[0].text = new_full_text
-                            else:
-                                paragraph.add_run(new_full_text)
+    # Additional fallback: try without namespace (for some Word versions)
+    try:
+        for element in doc.element.iter():
+            if element.text and old_text in element.text:
+                element.text = element.text.replace(old_text, new_text)
+            if element.tail and old_text in element.tail:
+                element.tail = element.tail.replace(old_text, new_text)
+    except Exception:
+        pass
 
 
 def transfer_format_and_remove_prev_blank(doc, filled_values: List[str]):
-    """For each filled value, find paragraphs containing it, and if the
-    immediately preceding sibling paragraph is blank, transfer paragraph and
-    run formatting from that blank paragraph into the filled paragraph,
-    then remove the blank paragraph element from the document tree.
-
-    This preserves the template styling while eliminating the empty row.
-    """
-    from docx.text.paragraph import Paragraph
-
-    def _transfer_and_remove(paragraph):
-        # previous sibling element
-        prev_elm = paragraph._p.getprevious()
-        if prev_elm is None:
-            return
-        # ensure it's a paragraph element
-        if not prev_elm.tag.endswith('}p'):
-            return
-        try:
-            prev_para = Paragraph(prev_elm, paragraph._parent)
-        except Exception:
-            return
-
-        if prev_para.text and prev_para.text.strip():
-            return
-
-        # Transfer paragraph-level formatting
-        try:
-            paragraph.style = prev_para.style
-        except Exception:
-            pass
-        try:
-            paragraph.alignment = prev_para.alignment
-        except Exception:
-            pass
-        # Transfer spacing and indentation if present
-        try:
-            paragraph.paragraph_format.left_indent = prev_para.paragraph_format.left_indent
-            paragraph.paragraph_format.right_indent = prev_para.paragraph_format.right_indent
-            paragraph.paragraph_format.first_line_indent = prev_para.paragraph_format.first_line_indent
-            paragraph.paragraph_format.space_before = prev_para.paragraph_format.space_before
-            paragraph.paragraph_format.space_after = prev_para.paragraph_format.space_after
-        except Exception:
-            pass
-
-        # Transfer run-level formatting: apply first non-empty run font of prev to first run of paragraph
-        try:
-            if prev_para.runs and paragraph.runs:
-                src_font = prev_para.runs[0].font
-                dst_font = paragraph.runs[0].font
-                # Copy common attributes if set
-                for attr in ('name', 'size', 'bold', 'italic', 'underline', 'color'):
-                    try:
-                        val = getattr(src_font, attr)
-                        if val is not None:
-                            setattr(dst_font, attr, val)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        # Remove the blank previous paragraph element
-        try:
-            prev_elm.getparent().remove(prev_elm)
-        except Exception:
-            pass
-
-    # Iterate through the document paragraphs and table cell paragraphs
-    # For each filled value, locate matching paragraphs and process them.
-    for value in filled_values:
-        if not value:
-            continue
-
-        # top-level paragraphs
-        for paragraph in list(doc.paragraphs):
-            if value in paragraph.text:
-                _transfer_and_remove(paragraph)
-
-        # paragraphs inside tables
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for paragraph in list(cell.paragraphs):
-                        if value in paragraph.text:
-                            _transfer_and_remove(paragraph)
+    """No-op placeholder to avoid formatting-related errors during export."""
+    return
 
 
 def remove_preceding_newline(doc, placeholder: str):
@@ -431,18 +455,75 @@ def main():
     st.set_page_config(layout='wide', page_title='Közéleti pontozó', initial_sidebar_state='expanded')
     
     # Compact CSS: reduce margins and padding
-    st.markdown("""
+    # Theme toggle (top-left sidebar)
+    with st.sidebar:
+        top_left = st.container()
+    with top_left:
+        if 'theme' not in st.session_state:
+            st.session_state['theme'] = 'dark'
+        theme_choice = st.radio('Téma', ['🌙 Dark', '☀️ Light'], index=0 if st.session_state['theme']=='dark' else 1)
+        st.session_state['theme'] = 'dark' if 'Dark' in theme_choice else 'light'
+
+    if st.session_state['theme'] == 'dark':
+        palette = {
+            'bg': '#0f172a',
+            'card': '#111827',
+            'muted': '#94a3b8',
+            'text': '#e2e8f0',
+            'accent': '#22d3ee',
+            'border': '#1f2937',
+            'button_text': '#0b1220'
+        }
+    else:
+        palette = {
+            'bg': '#f8fafc',
+            'card': '#ffffff',
+            'muted': '#475569',
+            'text': '#0f172a',
+            'accent': '#0ea5e9',
+            'border': '#e2e8f0',
+            'button_text': '#ffffff'
+        }
+
+    css = f"""
     <style>
-    .element-container {
-        margin-bottom: 0.5rem !important;
-    }
-    [data-testid="stVerticalBlock"] > [style*="flex-direction: column"] > [data-testid="stVerticalBlock"] {
+    :root {{
+        --bg: {palette['bg']};
+        --card: {palette['card']};
+        --muted: {palette['muted']};
+        --text: {palette['text']};
+        --accent: {palette['accent']};
+        --border: {palette['border']};
+    }}
+    body, .stApp, .main, [data-testid="stSidebar"], [data-testid="stHeader"], [data-testid="stToolbar"] {{
+        background: var(--bg) !important;
+        color: var(--text) !important;
+    }}
+    .block-container {{ padding-top: 1rem; }}
+    .element-container {{ margin-bottom: 0.5rem !important; }}
+    [data-testid="stVerticalBlock"] > [style*="flex-direction: column"] > [data-testid="stVerticalBlock"] {{
         gap: 0 !important;
-    }
-    h2 { margin-top: 0.3rem !important; margin-bottom: 0.3rem !important; }
-    h3 { margin-top: 0.2rem !important; margin-bottom: 0.2rem !important; }
+    }}
+    h1, h2, h3, h4, h5, h6, label, p, span, div {{
+        color: var(--text) !important;
+    }}
+    .stButton>button {{
+        background: var(--accent) !important;
+        color: {palette['button_text']} !important;
+        border: none !important;
+    }}
+    .stButton>button:hover {{ filter: brightness(0.95); }}
+    .stCheckbox>label, .stRadio>div>label {{ color: var(--text) !important; }}
+    .stTextInput>div>div>input, .stTextArea textarea, .stNumberInput input {{
+        background: var(--card) !important;
+        color: var(--text) !important;
+        border: 1px solid var(--border) !important;
+    }}
+    .stMetric {{ background: var(--card) !important; border: 1px solid var(--border); padding: 0.5rem; border-radius: 0.5rem; }}
+    .stMarkdown, .stCaption {{ color: var(--muted) !important; }}
     </style>
-    """, unsafe_allow_html=True)
+    """
+    st.markdown(css, unsafe_allow_html=True)
     
     st.title('Közéleti tevékenység pontozó')
 
@@ -457,22 +538,14 @@ def main():
             val = st.session_state.get(sel_key_local, 0)
             # treat 0 as no selection
             st.session_state['students'][sidx_local]['pontszam'][idx_local] = int(val) if int(val) != 0 else None
-            st.session_state['_last_update'] = st.session_state.get('_last_update', 0) + 1
-            # Save to disk
+            # Save to disk immediately without rerun
             save_scores(st.session_state['students'])
-            try:
-                if hasattr(st, 'experimental_rerun'):
-                    st.experimental_rerun()
-            except Exception:
-                pass
         return _cb
 
     def make_rel_callback(sidx_local, idx_local, rel_key_local):
         def _cb():
             val = st.session_state.get(rel_key_local, True)
             st.session_state['students'][sidx_local]['is_relevant'][idx_local] = bool(val)
-            st.session_state['_last_update'] = st.session_state.get('_last_update', 0) + 1
-            # Save to disk
             save_scores(st.session_state['students'])
         return _cb
 
@@ -480,8 +553,6 @@ def main():
         def _cb():
             val = st.session_state.get(done_key_local, False)
             st.session_state['students'][sidx_local]['is_done'] = bool(val)
-            st.session_state['_last_update'] = st.session_state.get('_last_update', 0) + 1
-            # Save to disk
             save_scores(st.session_state['students'])
         return _cb
     
@@ -489,7 +560,6 @@ def main():
         def _cb():
             val = st.session_state.get(desc_key_local, '')
             st.session_state['students'][sidx_local]['leiras'] = str(val)[:500]
-            st.session_state['_last_update'] = st.session_state.get('_last_update', 0) + 1
             save_scores(st.session_state['students'])
         return _cb
     
@@ -497,7 +567,6 @@ def main():
         def _cb():
             val = st.session_state.get(kat_key_local, '')
             st.session_state['students'][sidx_local]['kategoria'] = str(val)[:5]
-            st.session_state['_last_update'] = st.session_state.get('_last_update', 0) + 1
             save_scores(st.session_state['students'])
         return _cb
 
@@ -512,24 +581,28 @@ def main():
             point_val = min(point_val, max_pt)
             st.session_state['students'][sidx_local]['pontszam'][idx_local] = int(point_val)
         
-        st.session_state['_last_update'] = st.session_state.get('_last_update', 0) + 1
         save_scores(st.session_state['students'])
-        try:
-            if hasattr(st, 'experimental_rerun'):
-                st.experimental_rerun()
-        except Exception:
-            pass
     with st.sidebar:
         st.header('Hallgatók')
         opts = [f"{s['name']} — {calculate_total(s)}p ({calculate_osszeg(calculate_total(s))}){' ✓' if s['is_done'] else ''}" for s in students]
+
         if opts:
-            # Persist selected student index in session state
+            # Persist selected student index in session state even across reruns
             if 'selected_student_idx' not in st.session_state:
                 st.session_state['selected_student_idx'] = 0
-            sel = st.radio('Válassz hallgatót', options=list(range(len(opts))), format_func=lambda i: opts[i], key='selected_student_idx')
+
+            sel = st.radio(
+                'Válassz hallgatót',
+                options=list(range(len(opts))),
+                index=st.session_state['selected_student_idx'],
+                format_func=lambda i: opts[i],
+                key='sel_radio'
+            )
+            st.session_state['selected_student_idx'] = sel
         else:
             st.info('Nincs betöltött hallgató')
             return
+
         st.markdown(f"Összesen: **{len(students)}**")
 
     sidx = sel
@@ -639,17 +712,17 @@ def main():
 
     st.markdown('---')
     
-    # Category field (max 5 characters)
+    # Category field (max 2 characters)
     kat_key = f'kategoria_{sidx}'
     if kat_key not in st.session_state:
         st.session_state[kat_key] = students[sidx].get('kategoria', '')
     st.text_input(
         'Kategória',
         value=st.session_state.get(kat_key, ''),
-        max_chars=5,
+        max_chars=2,
         key=kat_key,
         on_change=make_kategoria_callback(sidx, kat_key),
-        placeholder='Max 5 karakter'
+        placeholder='Max 2 karakter'
     )
     
     # Description field (single for entire student) - hidden but stored
@@ -662,20 +735,15 @@ def main():
         max_chars=500,
         key=desc_key,
         on_change=make_leiras_callback(sidx, desc_key),
-        placeholder='Max 500 karakter...',
+        placeholder='A Pályázó...',
         height=80,
         label_visibility='collapsed'
     )
     
     st.markdown('---')
     # Actions
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     with c1:
-        if st.button('Mentés (letöltés CSV)'):
-            df = student_dataframe(students)
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button('Letöltés CSV', data=csv, file_name='scored_students.csv', mime='text/csv')
-    with c2:
         if st.button('Word doksi kitöltés'):
             filled_doc = fill_word_document(students[sidx])
             if filled_doc:
@@ -685,20 +753,9 @@ def main():
                     subprocess.Popen(['open', str(filled_doc)])
                 except Exception as e:
                     st.warning(f"Hiba a dokumentum megnyitásakor: {e}")
-    with c3:
+    with c2:
         if st.button('Frissít listát'):
-            # Try to rerun for Streamlit versions that expose the helper.
-            # Some Streamlit installations may not have `experimental_rerun` (different versions),
-            # so fall back to a harmless session-state update and a message.
-            try:
-                if hasattr(st, 'experimental_rerun'):
-                    st.experimental_rerun()
-                else:
-                    st.session_state['_last_update'] = st.session_state.get('_last_update', 0) + 1
-                    st.success('Lista frissítve')
-            except Exception:
-                st.session_state['_last_update'] = st.session_state.get('_last_update', 0) + 1
-                st.success('Lista frissítve')
+            st.success('Lista frissítve')
 
 
 if __name__ == '__main__':
