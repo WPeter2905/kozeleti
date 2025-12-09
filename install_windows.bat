@@ -50,18 +50,26 @@ echo.
 
 REM Upgrade pip
 echo 📦 pip frissítése...
-python -m pip install --upgrade pip --quiet
+python -m pip install --upgrade pip >nul 2>&1
 echo ✓ pip frissítve
 echo.
 
 REM Install requirements
 if exist "requirements.txt" (
-    echo 📦 Követelmények telepítése...
-    pip install -r requirements.txt --quiet
-    echo ✓ Követelmények telepítve
+    echo 📦 Függőségek telepítése...
+    echo    (Ez eltarthat néhány percig...)
+    pip install -r requirements.txt >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo ✓ Függőségek telepítve
+    ) else (
+        echo ⚠️  Hiba a függőségek telepítésekor
+        pip install -r requirements.txt
+        pause
+        exit /b 1
+    )
 ) else (
     echo ⚠️  requirements.txt nem található, alapértelmezett csomagok telepítése...
-    pip install streamlit pandas python-docx openpyxl --quiet
+    pip install streamlit pandas python-docx >nul 2>&1
     echo ✓ Alapértelmezett csomagok telepítve
 )
 echo.
